@@ -1,0 +1,388 @@
+# A code for multiple logistic regression models with a sliding window approach to create class imbalance, no augmentation
+# Load and balance dataset with equal samples from each group
+# Set up parameters for multiple logistic regression configurations
+# Split data into train/test sets with a sliding window applied to Group A sizes
+# Train logistic regression model for each configuration
+# Store all model coefficients across iterations
+# Identify and save top 10 features by coefficient magnitude
+# Evaluate model predictions using confusion matrices and AUC
+# Calculate accuracy, precision, recall, and F1-score
+# Save results and model details to Excel files
+
+library(dplyr)
+library(tidyr)
+library(openxlsx)
+library(pROC)
+
+
+# Load the dataset generated using a specific seed
+data_full <- read.xlsx("dataseed219.xlsx")
+
+# Balance the dataset by taking 600 samples from each group
+data <- data_full %>%
+    group_by(group) %>%
+    slice_head(n = 600) %>%
+    ungroup()
+
+# Initialize dataframes to store results
+all_results <- data.frame()
+model_coefficients <- data.frame()
+top10_coefficients <- data.frame()
+
+# Configuration parameters
+initial_size <- 600              # Initial size of each group
+step_size <- 3                   # Decrease in the Group A size for each config
+num_configs <- 185               # Number of iterations/configurations
+initial_test_A_size <- 200      # Starting size of test Group A
+initial_test_B_size <- 200      # Constant size of test Group B
+fixed_group_B_size <- 600       # Group B size remains constant throughout
+
+# Indices for group A and B
+group_A_indices <- which(data$group == "A")
+group_B_indices <- which(data$group == "B")
+
+set.seed(123)  # Base seed for reproducibility
+
+# Iterate over each configuration
+for (idx in seq_len(num_configs)) {
+    
+    # Update test sizes and seeds per iteration
+    group_A_test_size <- initial_test_A_size - (idx - 1)
+    group_B_test_size <- initial_test_B_size
+    
+    set.seed(456 + idx)  # Random seed for group A training split
+    group_A_train <- sample(
+        group_A_indices,
+        size = floor(2/3 * (initial_size - (idx - 1) * step_size))
+    )
+    
+    # Remaining group A samples used for test set
+    remaining_A <- setdiff(group_A_indices, group_A_train)
+    group_A_test <- if (length(remaining_A) < group_A_test_size) remaining_A else remaining_A[1:group_A_test_size]
+    
+    # Fix group B samples across all iterations
+    group_B_subset <- group_B_indices[1:fixed_group_B_size]
+    
+    set.seed(789 + idx)  # Random seed for group B training split
+    group_B_train <- sample(group_B_subset, size = floor(2/3 * fixed_group_B_size))
+    group_B_test <- setdiff(group_B_subset, group_B_train)[1:group_B_test_size]
+    
+    # Combine training and test indices
+    train_indices <- c(group_A_train, group_B_train)
+    test_indices <- c(group_A_test, group_B_test)
+    
+    train_data <- data[train_indices, ]
+    test_data <- data[test_indices, ]
+    
+    # Convert group to binary numeric for logistic regression
+    train_data$group <- as.numeric(train_data$group == "B")
+    
+    # Train logistic regression model
+    logistic_model <- glm(group ~ ., data = train_data, family = binomial)
+    
+    # Store all model coefficients
+    coef_df <- data.frame(
+        Feature = names(coef(logistic_model)),
+        Coefficient = coef(logistic_model),
+        Iteration = idx
+    )
+    model_coefficients <- bind_rows(model_coefficients, coef_df)
+    
+    # Store top 10 features by absolute coefficient magnitude
+    top10 <- coef_df %>%
+        filter(Feature != "(Intercept)") %>%
+        arrange(desc(abs(Coefficient))) %>%
+        head(10)
+    top10$Iteration <- idx
+    top10_coefficients <- bind_rows(top10_coefficients, top10)
+    
+    # Generate predictions on test set
+    test_probabilities <- predict(logistic_model, newdata = test_data, type = "response")
+    test_predictions <- ifelse(test_probabilities > 0.5, "B", "A")
+    
+    # Compute confusion matrix
+    test_conf_matrix <- table(Predicted = test_predictions, Actual = test_data$group)
+    
+    # Extract individual confusion matrix components
+    extract_conf_matrix_values <- function(conf_matrix) {
+        AA <- ifelse("A" %in% rownames(conf_matrix) && "A" %in% colnames(conf_matrix), conf_matrix["A", "A"], 0)
+        AB <- ifelse("B" %in% rownames(conf_matrix) && "A" %in% colnames(conf_matrix), conf_matrix["B", "A"], 0)
+        BA <- ifelse("A" %in% rownames(conf_matrix) && "B" %in% colnames(conf_matrix), conf_matrix["A", "B"], 0)
+        BB <- ifelse("B" %in% rownames(conf_matrix) && "B" %in% colnames(conf_matrix), conf_matrix["B", "B"], 0)
+        return(c(AA, AB, BA, BB))
+    }
+    
+    conf_values_test <- extract_conf_matrix_values(test_conf_matrix)
+    
+    # Compute AUC
+    roc_obj <- roc(test_data$group, test_probabilities)
+    auc_test <- as.numeric(auc(roc_obj))
+    
+    # Store iteration results
+    iteration_results <- data.frame(
+        iteration = idx,
+        group_A_train = length(group_A_train),
+        group_B_train = length(group_B_train),
+        total_test_A = length(group_A_test),
+        total_test_B = length(group_B_test),
+        test_cm_A_A = conf_values_test[1],
+        test_cm_A_B = conf_values_test[2],
+        test_cm_B_A = conf_values_test[3],
+        test_cm_B_B = conf_values_test[4],
+        auc_test = auc_test
+    )
+    
+    all_results <- bind_rows(all_results, iteration_results)
+}
+
+# Compute derived performance metrics
+all_results <- all_results %>%
+    mutate(
+        accuracy_test = (test_cm_A_A + test_cm_B_B) / 
+            (test_cm_A_A + test_cm_A_B + test_cm_B_A + test_cm_B_B),
+        precision_test = test_cm_A_A / (test_cm_A_A + test_cm_B_A),
+        recall_test = test_cm_A_A / (test_cm_A_A + test_cm_A_B),
+        f1_score_test = 2 * (precision_test * recall_test) / (precision_test + recall_test)
+    )
+
+# Additional percentages for tracking proportions
+all_results$Percent_A_to_all <- round(
+    100 * (all_results$group_A_train + all_results$total_test_A) / 
+        (all_results$group_A_train + all_results$group_B_train +
+             all_results$total_test_A + all_results$total_test_B), 1
+)
+
+all_results$Percent_true_A <- round(100 * all_results$test_cm_A_A / all_results$total_test_A, 1)
+all_results$Percent_true_B <- round(100 * all_results$test_cm_B_B / all_results$total_test_B, 1)
+
+# Save outputs
+write.xlsx(all_results, "LogReg_results.xlsx")
+write.xlsx(model_coefficients, "LogReg_model_coefficients.xlsx")
+write.xlsx(top10_coefficients, "LogReg_top10_coefficients.xlsx")
+
+
+
+# plotting
+library(dplyr)
+library(openxlsx)
+library(ggplot2)
+library(gridExtra)
+library(ggplotify)
+
+
+all_results <- read.xlsx("LogReg_results.xlsx")
+model_coefficients <- read.xlsx("LogReg_model_coefficients.xlsx")
+top10_coefficients <- read.xlsx("LogReg_top10_coefficients.xlsx")
+
+percent<-all_results[,c(1,24)]
+colnames(percent)[1] <- "Iteration"
+
+model_coefficients <- as.data.frame(full_join(model_coefficients, percent))
+
+top10_coefficients <- as.data.frame(full_join(top10_coefficients, percent))
+
+
+top10_coefficients_positive <- top10_coefficients[top10_coefficients$Coefficient > 0,]
+top10_coefficients_negative <- top10_coefficients[top10_coefficients$Coefficient < 0,]
+
+# lineplots
+xxx <- all_results
+
+p1 <- ggplot(xxx, aes(x = Percent_A_to_all)) +
+    geom_line(aes(y = Percent_true_A, color = "A"),  size = 0.3) +
+    geom_line(aes(y = Percent_true_B, color = "B"), size = 0.3) +
+    scale_color_manual(
+        values = c("A" = "red", "B" = "blue"),
+        labels = c("Group A", "Group B")
+    ) +
+    labs(x = "Percent of Group A in Total Data", 
+         y = "Percent Correctly Identified Samples", 
+         color = NULL,  # Suppress legend title
+         title = "Logistic Regression on Gene Expression Data  \nNo Augmentation") +
+    theme_classic() +
+    theme(plot.title = element_text(hjust = 0.5, size = 10)) +
+    # Vertical dashed lines in purple that stop at Percent_true_A
+    geom_segment(aes(x = 40, xend = 40, 
+                     y = 0, 
+                     yend = Percent_true_A[which.min(abs(Percent_A_to_all - 40))]), 
+                 linetype = "dashed", color = "purple", size = 0.2) +
+    geom_segment(aes(x = 45, xend = 45, 
+                     y = 0, 
+                     yend = Percent_true_A[which.min(abs(Percent_A_to_all - 45))]), 
+                 linetype = "dashed", color = "purple", size = 0.2) +
+    geom_segment(aes(x = 50, xend = 50, 
+                     y = 0, 
+                     yend = Percent_true_A[which.min(abs(Percent_A_to_all - 50))]), 
+                 linetype = "dashed", color = "purple", size = 0.2) +
+    # Horizontal dashed lines in purple from y-axis to the intersection points
+    geom_segment(aes(x = 0, xend = 40, 
+                     y = Percent_true_A[which.min(abs(Percent_A_to_all - 40))], 
+                     yend = Percent_true_A[which.min(abs(Percent_A_to_all - 40))]),
+                 linetype = "dashed", color = "purple", size = 0.2) +
+    geom_segment(aes(x = 0, xend = 45, 
+                     y = Percent_true_A[which.min(abs(Percent_A_to_all - 45))], 
+                     yend = Percent_true_A[which.min(abs(Percent_A_to_all - 45))]),
+                 linetype = "dashed", color = "purple", size = 0.2) +
+    geom_segment(aes(x = 0, xend = 50, 
+                     y = Percent_true_A[which.min(abs(Percent_A_to_all - 50))], 
+                     yend = Percent_true_A[which.min(abs(Percent_A_to_all - 50))]),
+                 linetype = "dashed", color = "purple", size = 0.2)
+
+
+t1 <- ggplot(xxx, aes(x = Percent_A_to_all)) +
+    geom_line(aes(y = accuracy_test, color = "accuracy_test"), size = 0.3) +
+    geom_line(aes(y = precision_test, color = "precision_test"), size = 0.3) +
+    geom_line(aes(y = recall_test, color = "recall_test"), size = 0.3) +
+    geom_line(aes(y = f1_score_test, color = "f1_score_test"), size = 0.3) +
+    geom_line(aes(y = auc_test, color = "auc_test"), , size = 0.3) +
+    scale_color_manual(values = c("accuracy_test" = "blue", 
+                                  "precision_test" = "red", 
+                                  "recall_test" = "green", 
+                                  "f1_score_test" = "purple", 
+                                  "auc_test" = "orange"),
+                       labels = c("Accuracy", "AUC", "f1 Score", "Precision", "Recall")
+    ) +
+    ylim(0, NA) +  
+    theme_classic() +
+    theme(plot.title = element_text(hjust = 0.5, size = 10)) +
+    labs(x = "Percent of Group A in Total Data", 
+         y = "", 
+         color = NULL, 
+         title = "Logistic Regression on Gene Expression Data  \nNo Augmentation")
+
+# Arrange the plots in a grid: 1 rows 2 columns
+combined_plot <- grid.arrange(
+    p1, t1,
+    nrow = 1,
+    ncol = 2
+)
+
+# Save the combined plot 
+ggsave("LogReg_GeneExp.png", combined_plot, width = 8.27, height = 3.6, units = "in")
+
+
+
+# barplots of frequencies of features within the top 10
+
+# Function to generate barplot with top 7 features and set x-axis limit to 185
+plot_feature_frequency <- function(feature_data, title, low_color, high_color) {
+    feature_counts <- as.data.frame(table(feature_data$Feature))
+    colnames(feature_counts) <- c("Feature", "Count")
+    feature_counts$Count <- as.numeric(feature_counts$Count)  # Convert Count to numeric
+    
+    # Keep only the top 7 features
+    top7_features <- feature_counts %>%
+        arrange(desc(Count)) %>%
+        slice_head(n = 7)
+    
+    ggplot(top7_features, aes(x = reorder(Feature, Count), y = Count, fill = Count)) +
+        geom_bar(stat = "identity") +
+        coord_flip() +
+        scale_fill_gradient(low = low_color, high = high_color) +
+        scale_y_continuous(limits = c(0, 185)) +  # Apply limit after flipping
+        theme_minimal() +
+        labs(title = title, x = "Feature", y = "Count") +
+        theme(axis.text.y = element_text(size = 7))
+}
+
+# Generate both barplots
+p1 <- plot_feature_frequency(top10_coefficients_positive, 
+                             "Top 7 Most Frequent Positive Features, Logistic Regression on Gene Expression Data \nNo Augmentation", 
+                             low_color = "#FDE725", high_color = "#440154")
+
+p2 <- plot_feature_frequency(top10_coefficients_negative, 
+                             "Top 7 Most Frequent Negative Features, Logistic Regression on Gene Expression Data \nNo Augmentation", 
+                             low_color = "#1f77b4", high_color = "#ff7f0e")
+
+# Arrange and convert to ggplot object
+combined_plot <- as.ggplot(grid.arrange(p1, p2, nrow = 2))
+
+# Save the plot correctly
+ggsave("LogReg_GeneExp_feature_frequency_barplots_combined.png", combined_plot, width = 8.27, height = 3.6, dpi = 300, bg = "white")
+
+
+# plot coefficients of top 4 most frequent features
+# positive features
+# remove outliers manually when necessary
+# Count feature occurrences across all iterations
+feature_counts <- table(unlist(top10_coefficients_positive$Feature))
+
+# Select the top 4 most frequent features
+top_features <- names(sort(feature_counts, decreasing = TRUE))[1:4]
+
+# Filter data for the selected top features and ensure Percent_A_to_all >= 10%
+filtered_data <- top10_coefficients_positive %>%
+    filter(Feature %in% top_features, Percent_A_to_all >= 10) %>%
+    arrange(desc(Percent_A_to_all))  # Reverse order
+
+# Print the biggest coefficients for inspection
+cat("Max Coefficients:\n")
+print(head(filtered_data %>% arrange(-Coefficient), 5))  # Show 5 top coefficients
+
+# Uncomment and modify this line to remove extreme values manually
+filtered_data <- filtered_data %>% filter(Coefficient < 50)  # Adjust threshold as needed
+
+# Define breaks to reduce the number of x-axis labels
+break_positions <- unique(filtered_data$Percent_A_to_all)[seq(1, length(unique(filtered_data$Percent_A_to_all)), length.out = 10)]
+
+# Plot the coefficients against Percent_A_to_all
+ggplot(filtered_data, aes(x = Percent_A_to_all, y = Coefficient, color = Feature, group = Feature)) + 
+    geom_line(size = 1) + 
+    geom_point(size = 2) +
+    scale_x_continuous(breaks = break_positions, limits = c(10, max(filtered_data$Percent_A_to_all))) +  # Start at 10%
+    scale_color_manual(values = c("#1F77B4", "#17BECF", "#9D8FCE", "#6D6D76")) +  # Cooler, more subdued tones
+    labs(x = "Percent of Group A in Total Data", y = "Coefficient", color = "Feature", title = "Top 4 Positive Features, Logistic Regression, No Augmentation") +
+    theme_minimal() +
+    theme(
+        plot.title = element_text(hjust = 0.5, size = 20), 
+        axis.text.x = element_text(angle = 90, hjust = 1),
+        axis.title.x = element_text(size = 16),  # Increase size of x-axis label
+        axis.title.y = element_text(size = 16),  # Increase size of y-axis label
+        legend.title = element_text(size = 14),  # Increase size of legend title
+        legend.text = element_text(size = 12)    # Increase size of legend text
+    )
+
+ggsave("LogReg_GeneExp_top4_positive_coefficients_lineplot.png", width = 12, height = 5, dpi = 300, bg = "white")
+
+# negative features
+# Count feature occurrences across all iterations
+feature_counts <- table(unlist(top10_coefficients_negative$Feature))
+
+# Select the top 4 most frequent features
+top_features <- names(sort(feature_counts, decreasing = TRUE))[1:4]
+
+# Filter data for the selected top features and ensure Percent_A_to_all >= 10%
+filtered_data <- top10_coefficients_negative %>%
+    filter(Feature %in% top_features, Percent_A_to_all >= 10) %>%
+    arrange(desc(Percent_A_to_all))  # Reverse order
+
+# Print the lowest coefficients for inspection
+cat("Min Coefficients:\n")
+print(head(filtered_data %>% arrange(Coefficient), 5))  # Show 5 lowest coefficients
+
+# Uncomment and modify this line to remove extreme values manually
+# filtered_data <- filtered_data %>% filter(Coefficient > -50)  # Adjust threshold as needed
+
+# Define breaks to reduce the number of x-axis labels
+break_positions <- unique(filtered_data$Percent_A_to_all)[seq(1, length(unique(filtered_data$Percent_A_to_all)), length.out = 10)]
+
+# Plot the coefficients against Percent_A_to_all
+ggplot(filtered_data, aes(x = Percent_A_to_all, y = Coefficient, color = Feature, group = Feature)) + 
+    geom_line(size = 1) + 
+    geom_point(size = 2) +
+    scale_x_continuous(breaks = break_positions, limits = c(10, max(filtered_data$Percent_A_to_all))) +  # Start at 10%
+    scale_color_manual(values = c("#1F77B4", "#17BECF", "#9D8FCE", "#6D6D76")) +  # Cooler, more subdued tones
+    labs(x = "Percent of Group A in Total Data", y = "Coefficient", color = "Feature", title = "Top 4 Negative Features, Logistic Regression, No Augmentation") +
+    theme_minimal() +
+    theme(
+        plot.title = element_text(hjust = 0.5, size = 20), 
+        axis.text.x = element_text(angle = 90, hjust = 1),
+        axis.title.x = element_text(size = 16),  # Increase size of x-axis label
+        axis.title.y = element_text(size = 16),  # Increase size of y-axis label
+        legend.title = element_text(size = 14),  # Increase size of legend title
+        legend.text = element_text(size = 12)    # Increase size of legend text
+    )
+
+# Save the plot
+ggsave("LogReg_GeneExp_top4_negative_coefficients_lineplot.png", width = 12, height = 5, dpi = 300, bg = "white")
+
